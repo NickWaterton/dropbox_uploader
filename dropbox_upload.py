@@ -26,8 +26,8 @@ from dropbox_content_hasher import DropboxContentHasher
 __version__ = "1.0.0"
 
 APP = 'NicksPythonUploader'
-#Put your app key here
-APP_KEY = 'qsyrwq1sch9u145'
+#Put your app key here (or include it as an argument to command line)
+APP_KEY = ''
 
 utc=pytz.UTC
 
@@ -130,11 +130,16 @@ class MyHandler(FileSystemEventHandler):
         return False
 
 class DropBoxUpload:
-    def __init__(self, timeout=100, chunk=50, log=None):
+
+    __version__ = __version__
+    APP_KEY = APP_KEY
+
+    def __init__(self, timeout=100, chunk=50, app_key=None, log=None):
         self.timeout = timeout
         #max chunk size 150MB in 4MB increments
         self.chunk = min(max(chunk, 1) * 4096 * 1024, 150 * 4096 * 1024)//4
         self.log = log if log is not None else logging.getLogger('Main.'+self.__class__.__name__)
+        self.APP_KEY = app_key if app_key else self.APP_KEY
         #dont calculate hash size for files bigger than this as it takes too long...
         self.max_file_size_for_hash = 1024*100
         self.lock = threading.Lock()
@@ -145,11 +150,18 @@ class DropBoxUpload:
         try:
             with open(filename, 'r') as f:
                 self.tokens = json.load(f)
-                with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+                if not self.APP_KEY:
+                    self.APP_KEY = self.tokens['app_key']
+                    self.log.info(f'Loaded app_key: {self.APP_KEY}')
+                with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                     dbx.users_get_current_account()
                     self.log.info("Successfully connected to Dropbox")
         except Exception as e:
-            self.authorize()
+            if self.APP_KEY:
+                self.authorize()
+            else:
+                self.log.error('You need to re-run the program with your APP_KEY added as an option')
+                sys.exit(1)
             
     def load_inProgress(self, filename='files_in_progress.json'):
         try:
@@ -195,7 +207,7 @@ class DropBoxUpload:
             
     def authorize(self):
         self.tokens = None
-        auth_flow = DropboxOAuth2FlowNoRedirect(APP_KEY, use_pkce=True, token_access_type='offline')
+        auth_flow = DropboxOAuth2FlowNoRedirect(self.APP_KEY, use_pkce=True, token_access_type='offline')
         authorize_url = auth_flow.start()
         self.log.info("1. Go to: " + authorize_url)
         self.log.info("2. Click \"Allow\" (you might have to log in first).")
@@ -208,7 +220,7 @@ class DropBoxUpload:
             self.log.exception(e)
             sys.exit(1)
 
-        with dropbox.Dropbox(oauth2_refresh_token=oauth_result.refresh_token, app_key=APP_KEY) as dbx:
+        with dropbox.Dropbox(oauth2_refresh_token=oauth_result.refresh_token, app_key=self.APP_KEY) as dbx:
             dbx.users_get_current_account()
             self.log.info("Successfully set up client!")
             
@@ -218,7 +230,7 @@ class DropBoxUpload:
             self.log.info(f'Refresh Token = {oauth_result.refresh_token}')
             self.log.info(f'Expiration    = {oauth_result.expires_at}')
             self.log.info(f'Scope         = {oauth_result.scope}')
-            self.tokens =   {   'app_key'       : APP_KEY,
+            self.tokens =   {   'app_key'       : self.APP_KEY,
                                 'access_token'  : oauth_result.access_token,
                                 'account_id'    : oauth_result.account_id,
                                 'refresh_token' : oauth_result.refresh_token,
@@ -236,7 +248,7 @@ class DropBoxUpload:
             self.log.info('{}Uploaded {:.2f}%'.format(filename, 100).ljust(15) + ' --- {:.0f}m {:.0f}s'.format(time_elapsed//60,time_elapsed%60).rjust(15))
         
     def get_client_info(self):
-        with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+        with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
             full_account = dbx.users_get_current_account()
             self.log.info('linked account:\nName: {}\nE-Mail: {}'.format(full_account.name.display_name, full_account.email))
             
@@ -249,7 +261,7 @@ class DropBoxUpload:
     def file_list(self, path, recursive=False):
         try:
             files_list = []
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 files = dbx.files_list_folder(path)
                 files_list.extend(files.entries)
                 while files.has_more:
@@ -268,7 +280,7 @@ class DropBoxUpload:
         FileMetadata(client_modified=datetime.datetime(2022, 3, 24, 14, 24, 28), content_hash='d21e4db582bb4a0de329a9c238c34063a61d0c3bd7d39bce43af57b67d5d4a3a', export_info=NOT_SET, file_lock_info=NOT_SET, has_explicit_shared_members=NOT_SET, id='id:cAa78Yx2AucAAAAAAAAsXQ', is_downloadable=True, media_info=NOT_SET, name='vzdump-qemu-122-2022_03_11-01_00_02.log', parent_shared_folder_id=NOT_SET, path_display='/Backups/dump/vzdump-qemu-122-2022_03_11-01_00_02.log', path_lower='/backups/dump/vzdump-qemu-122-2022_03_11-01_00_02.log', property_groups=NOT_SET, rev='5daf79a957e1213d61aab', server_modified=datetime.datetime(2022, 3, 24, 14, 24, 28), sharing_info=NOT_SET, size=7331, symlink_info=NOT_SET)
         '''
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 file = dbx.files_alpha_get_metadata(path)
                 self.log.debug(file)
                 return file
@@ -312,7 +324,7 @@ class DropBoxUpload:
         
     def get_free_space(self):
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 space = dbx.users_get_space_usage()
                 if space.allocation.is_individual():
                     allocated = space.allocation.get_individual().allocated
@@ -329,7 +341,7 @@ class DropBoxUpload:
         
     def check_directory(self, path):
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 folder = dbx.files_get_metadata(path)
                 self.log.debug(folder)
                 if isinstance(folder, dropbox.files.FolderMetadata):
@@ -346,7 +358,7 @@ class DropBoxUpload:
             self.log.error('cannot create root folder')
             return
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 self.log.info('Creating directory: {}'.format(path))
                 folder = dbx.files_create_folder_v2(path)
                 self.log.debug(folder)
@@ -395,7 +407,7 @@ class DropBoxUpload:
             self.log.error('cannot delete all files/folders in {}'.format(path))
             return False
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 dbx.files_delete_v2(path)
                 self.log.info('Deleted: {}'.format(path))
                 return True
@@ -420,7 +432,7 @@ class DropBoxUpload:
             return
 
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 file_size = os.path.getsize(file_path)
                 file_basename = os.path.basename(file_path)
                 dest_path = upload_path if destinationIsFile else join_path(upload_path, file_basename)
@@ -525,7 +537,7 @@ class DropBoxUpload:
             return
         with self.lock: #only one batch upload at a time allowed
             try:
-                with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+                with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                     uploadEntryList = []
                     threads = []
                         
@@ -558,7 +570,7 @@ class DropBoxUpload:
         
     def check_status(self, job_id):
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 if isinstance(job_id, dropbox.files.UploadSessionFinishBatchLaunch):
                     if job_id.is_complete():
                         self.log.info('Upload Compete')
@@ -624,7 +636,7 @@ class DropBoxUpload:
                             
     def download_file(self, path, download_path):
         try:
-            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=APP_KEY) as dbx:
+            with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 if not os.path.isdir(path):
                     os.makedirs(path)
                 self.log.info('Downloading File: {} to {}'.format(download_path, path))
@@ -712,6 +724,7 @@ def main():
     parser.add_argument('-r','--recursive', action='store_true', help='Recurse into subdirectories', default=False)
     parser.add_argument('-l','--log', action='store',type=str, default="/home/nick/Scripts/dropbox.log", help='path/name of log file (default: /home/nick/Scripts/dropbox.log)')
     parser.add_argument('-D','--debug', action='store_true', help='debug mode', default=False)
+    parser.add_argument('-a','--app_key', type=str, default=None, help='your APP_KEY from Dropbox (only needed for first time authentication)')
     parser.add_argument('--version', action='version', version="%(prog)s ("+__version__+")")
     arg = parser.parse_args()
     
@@ -746,7 +759,7 @@ def main():
     if arg.upload_path is not None and not arg.upload_path.startswith('/'):
         arg.upload_path = '/' + arg.upload_path
     
-    dbu = DropBoxUpload(timeout=arg.timeout, chunk=arg.chunk, log=log)
+    dbu = DropBoxUpload(timeout=arg.timeout, chunk=arg.chunk, app_key=arg.app_key, log=log)
     log.info('Action: {}'.format(arg.action))
     if arg.action == 'client':
         dbu.get_client_info()
@@ -816,7 +829,8 @@ def main():
                     if arg.older_than > 0:
                         dbu.delete_files(dbu, arg)
                 time.sleep(60)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
+            log.info('Stopping observer')
             observer.stop()
         observer.join()
         
