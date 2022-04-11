@@ -18,10 +18,10 @@ Need to create a dropbox app via the Dropbox developer page
 
 See https://developers.dropbox.com/oauth-guide
 
-When you have an AppId edit dropbox_upload.py and edit `APP_KEY = ''` to add your App ID.
+When you have an AppKey edit dropbox_upload.py and edit `APP_KEY = ''` to add your App Key.
 OR append the AppId to the command line as follows:
 
-Run the program `./dropbox_upload.py client -a <AppId>` which will then give instructions on how to authorize the program for Dropbox access.
+Run the program `./dropbox_upload.py client -a <AppKey>` which will then give instructions on how to authorize the program for Dropbox access.
 
 The generated credentials are saved in the file `config.json` so you only have to perform the authorization once. Never share this file!
 
