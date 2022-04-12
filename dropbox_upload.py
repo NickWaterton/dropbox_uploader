@@ -833,11 +833,10 @@ def main():
             log.info('Stopping observer')
             observer.stop()
         observer.join()
+        log.info('Program Exited')
         
     while threading.active_count() > 0:    #wait for resumed uploads to complete
         time.sleep(10)
-        
-    log.info('Program Exited')
 
 if __name__ == "__main__":
     main()
