@@ -66,8 +66,8 @@ class MyHandler(FileSystemEventHandler):
                         self.log.debug('Removed thread (moved): {}'.format(event.src_path))
                     path = event.dest_path
 
-                # the file will be processed here
-                if path not in self.threads.keys():
+                # the file will be processed here (ignore tmp files)
+                if path not in self.threads.keys() and not path.endswith('.tmp'):
                     self.log.info("file: {}, event: {}".format(path, event.event_type))
                     self.threads[path] = threading.Thread(target=self.wait_for_file_to_arrive, args=(path, event.event_type == 'moved'), daemon=True).start()
 
@@ -836,6 +836,8 @@ def main():
         
     while threading.active_count() > 0:    #wait for resumed uploads to complete
         time.sleep(10)
+        
+    log.info('Program Exited')
 
 if __name__ == "__main__":
     main()
