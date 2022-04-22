@@ -31,32 +31,35 @@ if you need to re-authenticate for some reason, delete `config.json` and re-run 
 
 ```
 nick@Backup-Public:~/Scripts/dropbox_upload$ ./dropbox_upload.py -h
-usage: dropbox_upload.py [-h] [-f FILE_PATH] [-u UPLOAD_PATH] [-t TIMEOUT] [-c CHUNK] [-o] [-O OLDER_THAN] [-r] [-l LOG]
-                         [-D] [-a APP_KEY] [--version]
+usage: dropbox_upload.py [-h] [-f FILE_PATH] [-u UPLOAD_PATH] [-t TIMEOUT] [-c CHUNK] [-m MIN_FREE_SPACE] [-o] [-O OLDER_THAN] [-r]
+                         [-l LOG] [-D] [-a APP_KEY] [--version]
                          {client,list,info,upload,delete,delete_folder,monitor,download}
 
 Upload/Download files to/from dropbox
 
 positional arguments:
   {client,list,info,upload,delete,delete_folder,monitor,download}
-                        action to take
+                        action to take (default: None)
 
 optional arguments:
   -h, --help            show this help message and exit
   -f FILE_PATH, --file_path FILE_PATH
-                        path to file to upload
+                        path to file to upload (default: None)
   -u UPLOAD_PATH, --upload_path UPLOAD_PATH
-                        path in dropbox
+                        path in dropbox (default: None)
   -t TIMEOUT, --timeout TIMEOUT
+                        upload timeout (seconds) (default: 100)
   -c CHUNK, --chunk CHUNK
-                        chunk size in MB
-  -o, --overwrite       Overwrite Exisitng Files
+                        chunk size in MB (default: 50)
+  -m MIN_FREE_SPACE, --min_free_space MIN_FREE_SPACE
+                        minnimum free space for upload when monitoring as % of total (default: 25)
+  -o, --overwrite       Overwrite Exisitng Files (default: False)
   -O OLDER_THAN, --older_than OLDER_THAN
-                        Delete files older than x days
-  -r, --recursive       Recurse into subdirectories
+                        Delete files older than x days (0=disabled) (default: 0)
+  -r, --recursive       Recurse into subdirectories (default: False)
   -l LOG, --log LOG     path/name of log file (default: /home/nick/Scripts/dropbox.log)
-  -D, --debug           debug mode
+  -D, --debug           debug mode (default: False)
   -a APP_KEY, --app_key APP_KEY
-                        your APP_KEY from Dropbox (only needed for first time authentication)
+                        your APP_KEY from Dropbox (only needed for first time authentication) (default: None)
   --version             show program's version number and exit
 ```

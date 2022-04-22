@@ -332,6 +332,14 @@ class DropBoxUpload:
         return False
         
     def get_free_space(self):
+        allocated, used = self.get_dropbox_space_info()
+        return allocated - used if allocated != float("inf") else allocated
+        
+    def get_free_space_percent(self):
+        allocated, used = self.get_dropbox_space_info()
+        return 100*(allocated - used)//allocated if allocated != float("inf") else 100
+        
+    def get_dropbox_space_info(self):
         try:
             with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                 space = dbx.users_get_space_usage()
@@ -341,12 +349,13 @@ class DropBoxUpload:
                     self.log.warning('This is a team space allocation - not individual')
                     allocated = space.allocation.get_team().allocated
                 elif space.allocation.is_other():
-                    return float("inf")
+                    self.log.warning('This is an other space allocation - not individual')
+                    return float("inf"), 0
                 self.log.debug('Dropbox Space: allocated: {}, used: {}, free: {}({}%)'.format(human_size(allocated), human_size(space.used), human_size(allocated - space.used), 100*(allocated - space.used)//allocated))
-                return allocated - space.used
+                return allocated, space.used
         except ApiError as e:
             self.log.exception(e)
-        return float("inf")
+        return float("inf"), 0
         
     def check_directory(self, path):
         try:
@@ -736,17 +745,18 @@ def exit_handler(signum, frame):
 
 def main():
     parser = argparse.ArgumentParser(description='Upload/Download files to/from dropbox')
-    parser.add_argument('action', type=str, choices=['client', 'list', 'info', 'upload', 'delete', 'delete_folder', 'monitor', 'download'], default=None, help='action to take')
-    parser.add_argument('-f','--file_path', type=str, default=None, help='path to file to upload')
-    parser.add_argument('-u','--upload_path', type=str, default=None, help='path in dropbox')
-    parser.add_argument('-t','--timeout', type=int, default=100)
-    parser.add_argument('-c','--chunk', type=int, default=50, help='chunk size in MB')
-    parser.add_argument('-o','--overwrite', action='store_true', help='Overwrite Exisitng Files', default=False)
-    parser.add_argument('-O', '--older_than', type=int, help='Delete files older than x days', default=0)
-    parser.add_argument('-r','--recursive', action='store_true', help='Recurse into subdirectories', default=False)
-    parser.add_argument('-l','--log', action='store',type=str, default="/home/nick/Scripts/dropbox.log", help='path/name of log file (default: /home/nick/Scripts/dropbox.log)')
-    parser.add_argument('-D','--debug', action='store_true', help='debug mode', default=False)
-    parser.add_argument('-a','--app_key', type=str, default=None, help='your APP_KEY from Dropbox (only needed for first time authentication)')
+    parser.add_argument('action', type=str, choices=['client', 'list', 'info', 'upload', 'delete', 'delete_folder', 'monitor', 'download'], default=None, help='action to take (default: %(default)s)')
+    parser.add_argument('-f','--file_path', type=str, default=None, help='path to file to upload (default: %(default)s)')
+    parser.add_argument('-u','--upload_path', type=str, default=None, help='path in dropbox (default: %(default)s)')
+    parser.add_argument('-t','--timeout', type=int, default=100, help='upload timeout (seconds) (default: %(default)s)')
+    parser.add_argument('-c','--chunk', type=int, default=50, help='chunk size in MB (default: %(default)s)')
+    parser.add_argument('-m','--min_free_space', type=int, default=25, help='minnimum free space for upload when monitoring as %% of total (default: %(default)s)')
+    parser.add_argument('-o','--overwrite', action='store_true', default=False, help='Overwrite Exisitng Files (default: %(default)s)')
+    parser.add_argument('-O', '--older_than', type=int, default=0, help='Delete files older than x days (0=disabled) (default: %(default)s)')
+    parser.add_argument('-r','--recursive', action='store_true', default=False, help='Recurse into subdirectories (default: %(default)s)')
+    parser.add_argument('-l','--log', action='store',type=str, default="/home/nick/Scripts/dropbox.log", help='path/name of log file (default: %(default)s)')
+    parser.add_argument('-D','--debug', action='store_true', default=False, help='debug mode (default: %(default)s)')
+    parser.add_argument('-a','--app_key', type=str, default=None, help='your APP_KEY from Dropbox (only needed for first time authentication) (default: %(default)s)')
     parser.add_argument('--version', action='version', version="%(prog)s ("+__version__+")")
     arg = parser.parse_args()
     
@@ -824,9 +834,7 @@ def main():
         if not os.path.isdir(arg.file_path):
             self.log.error('--file_path: {} Must be a directory'.format(arg.file_path))
             sys.exit(1)
-            
-        min_free_space = 500 * 1024 * 1024 * 1024
-            
+               
         time.sleep(len(dbu.files)*2)    #wait for interrupted files to resume uploading
         older_than = datetime.now(timezone.utc) - timedelta(days=arg.older_than)
         log.info('Uploading files in {} to {} newer than {}'.format(arg.file_path, arg.upload_path, older_than.isoformat()))
@@ -844,10 +852,10 @@ def main():
         observer.start()
         try:
             while True:
-                space = dbu.get_free_space()
-                log.info("Monitoring {} files, Dropbox free space: {}".format(len(Handler.threads), human_size(space)))
-                if (space < min_free_space):
-                    self.log.warning('Free space is {}, less than minnimum allowed: {}'.format(human_size(space), human_size(min_free_space)))
+                pct_free = dbu.get_free_space_percent()
+                log.info("Monitoring {} files, Dropbox free space: {}%".format(len(Handler.threads), pct_free))
+                if (pct_free < arg.min_free_space):
+                    self.log.warning('Free space is {}%, less than minnimum allowed: {}%'.format(pct_free, arg.min_free_space))
                     if arg.older_than > 0:
                         dbu.delete_files(dbu, arg)
                 time.sleep(60)
