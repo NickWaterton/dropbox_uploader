@@ -459,8 +459,12 @@ class DropBoxUpload:
                     return True
                     
                 space = self.get_free_space()
-                if file_size >= space:
-                    self.log.warning('File {} is too large to upload. Size: {}, Space: {}'.format(file_basename, human_size(file_size), human_size(space)))
+                upload_size = file_size
+                for k, v in self.files.items():
+                    if k != file_path and v.get('uploading', False):
+                        upload_size += v.get('filesize', 0)
+                if upload_size >= space:
+                    self.log.warning('File {} is too large to upload. Size: {}, Space: {}, Currently uploading: {}'.format(file_basename, human_size(file_size), human_size(space), human_size(upload_size - file_size)))
                     return True
                         
                 since = time.time()
