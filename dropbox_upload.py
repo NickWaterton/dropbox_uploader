@@ -83,13 +83,19 @@ class MyHandler(FileSystemEventHandler):
         
     def wait_for_file_to_arrive(self, file, immediate=False):
         try:
+            count = 0
             self.log.debug("Waiting for: file: {}, immediate: {}".format(file, immediate))
             if immediate or self.file_has_arrived(file):
                 self.log.info("file: {}, has finished updating".format(file))
                 #upload file to dropbox
                 if os.path.exists(file):
                     self.log.info('Uploading: file: {}'.format(file))
-                    self.dbu.upload_files(file, self.arg.upload_path, self.arg.overwrite)
+                    while not self.dbu.upload_files(file, self.arg.upload_path, self.arg.overwrite):
+                        if (count := count + 1) >= 5:
+                            self.log.error('Too many retries uploading {file}: aborting')
+                            break
+                        self.log.warning(f'Upload of {file} Failed, retrying in 60 seconds: {count}')
+                        time.sleep(60)
                 else:
                     self.log.warning('Not Uploading File: {}, file does not exist'.format(file))
             else:
@@ -100,6 +106,7 @@ class MyHandler(FileSystemEventHandler):
             self.log.debug('Removed thread: {}'.format(file))
                 
     def file_has_arrived(self, file):
+        size = 0
         size2 = -1
         count = 0
         while count < 5:
@@ -142,6 +149,7 @@ class DropBoxUpload:
         self.APP_KEY = app_key if app_key else self.APP_KEY
         #dont calculate hash size for files bigger than this as it takes too long...
         self.max_file_size_for_hash = 1024*100
+        self.uploadEntryList = []
         self.lock = threading.Lock()
         self.load_tokens()
         self.load_inProgress()
@@ -166,8 +174,9 @@ class DropBoxUpload:
     def load_inProgress(self, filename='files_in_progress.json'):
         try:
             batch_files = {}
-            with open(filename, 'r') as f:
-                self.files = json.load(f)
+            if filename:
+                with open(filename, 'r') as f:
+                    self.files = json.load(f)
             for k, v in self.files.copy().items():
                 self.files[k]['uploading'] = False
                 if datetime.fromisoformat(v.get('date', datetime.now().isoformat())) < datetime.now() - timedelta(days = 5):
@@ -177,7 +186,7 @@ class DropBoxUpload:
                     if os.path.isfile(k) and os.path.getsize(k) == v.get('filesize',-1):
                         if not self.files[k].get('batch', False):
                             self.log.info('File Upload interrupted: {}, {}%, to {}'.format(k, round(100*v['position']/v['filesize'], 2), v['destination']))
-                            threading.Thread(target=self.upload_file, args=(k, v['destination'], True, None, True), daemon=True).start()
+                            threading.Thread(target=self.upload_file, args=(k, v['destination'], True, False, True), daemon=True).start()
                         else:
                             batch_files[k] = v
                     else:
@@ -415,21 +424,21 @@ class DropBoxUpload:
             self.log.exception(e)
         return False
                 
-    def upload_files(self, path, upload_path, overwrite=False, recursive=False, uploadEntryList=None, depth=0):
+    def upload_files(self, path, upload_path, overwrite=False, recursive=False, batch=False, depth=0):
         if os.path.isfile(path):
-            self.upload_file(path, upload_path, overwrite, uploadEntryList, destinationIsFile=False)
+            return self.upload_file(path, upload_path, overwrite, batch, destinationIsFile=False)
         elif os.path.isdir(path):
             if not recursive and depth >= 1:
-                return
+                return True
             depth+=1
             for file in os.listdir(path):
-                self.upload_files(os.path.join(path, file), upload_path, overwrite, recursive, uploadEntryList, depth) 
+                self.upload_files(os.path.join(path, file), upload_path, overwrite, recursive, batch, depth) 
 
-    def upload_file(self, file_path, upload_path, overwrite=True, uploadEntryList=None, destinationIsFile=False):
+    def upload_file(self, file_path, upload_path, overwrite=True, batch=False, destinationIsFile=False):
         
         if self.files.get(file_path, {}).get('uploading', False):
             self.log.info('Already uploading: {}'.format(file_path))
-            return
+            return True
 
         try:
             with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
@@ -438,17 +447,17 @@ class DropBoxUpload:
                 dest_path = upload_path if destinationIsFile else join_path(upload_path, file_basename)
                 if not overwrite and self.duplicate_file(file_path, dest_path):
                     self.log.debug("File {} already exists in the destination folder - not overwriting".format(file_basename))
-                    return
+                    return True
                         
                 since = time.time()
                 if not file_path in self.files.keys():
                     self.files[file_path] = {}
                 self.files[file_path]['uploading'] = True
-                self.files[file_path]['batch'] = uploadEntryList is not None
+                self.files[file_path]['batch'] = batch
                 
                 self.log.info('Uploading file: {} => {}'.format(file_path, dest_path))
                 with open(file_path, 'rb') as f:
-                    if file_size <= self.chunk and uploadEntryList is None:
+                    if file_size <= self.chunk and not batch:
                         dbx.files_upload(f.read(), dest_path, client_modified=self.get_modified_time(file_path))
                         self.show_progress(time.time() - since, filename=file_basename)
                         self.files.pop(file_path, None)
@@ -473,7 +482,7 @@ class DropBoxUpload:
                         self.save_inProgress()
                         while f.tell() <= file_size:
                             if ((file_size - f.tell()) <= self.chunk):
-                                if uploadEntryList is None:
+                                if not batch:
                                     dbx.files_upload_session_finish(f.read(self.chunk), cursor, commit)
                                     self.files.pop(file_path, None)
                                 else:
@@ -485,10 +494,11 @@ class DropBoxUpload:
                                             self.log.warning('{}, session closed'.format(file_path))
                                         else:
                                             self.log.exception(e)
+                                            time.sleep(10)
                                     self.files[file_path]['position'] = f.tell()
-                                    uploadEntryList.append(dropbox.files.UploadSessionFinishArg(cursor=cursor, commit=commit))
+                                    self.uploadEntryList.append(dropbox.files.UploadSessionFinishArg(cursor=cursor, commit=commit))
                                 self.show_progress(time.time() - since, filename=file_basename)
-                                self.log.info('{} {}'.format(file_path, 'Upload Completed' if uploadEntryList is None else 'Pending Completion'))
+                                self.log.info('{} {}'.format(file_path, 'Upload Completed' if not batch else 'Pending Completion'))
                                 break
                             else:
                                 try:
@@ -501,14 +511,21 @@ class DropBoxUpload:
                                         cursor.offset = correct_offset
                                         f.seek(correct_offset)
                                     else:
-                                        raise
-                                        
+                                        self.log.exception(e)
+                                        time.sleep(10)
                                 self.files[file_path]['position'] = f.tell()
                                 self.show_progress(time.time() - since, 100*f.tell()/file_size, filename=file_basename)
                             self.save_inProgress()
                 self.save_inProgress()
+            return True
         except ApiError as e:
+            self.log.error(e)
+        except Exception as e:
             self.log.exception(e)
+        if file_path in self.files.keys():
+            self.files[file_path]['uploading'] = False
+        self.save_inProgress()
+        return False
             
     def get_file_list(self, dir_path, upload_path, overwrite=True, recursive=False, older_than=None, file_dict={}):
         if os.path.isdir(dir_path):
@@ -537,8 +554,9 @@ class DropBoxUpload:
             return
         with self.lock: #only one batch upload at a time allowed
             try:
+                self.log.info('Batch Upload Starting {}'.format(dir_path if isinstance(dir_path, str) else list(dir_path.keys())))
                 with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
-                    uploadEntryList = []
+                    #self.uploadEntryList = []
                     threads = []
                         
                     if isinstance(dir_path, str):
@@ -554,19 +572,23 @@ class DropBoxUpload:
 
                         upload_path = dir_path[file_path].get('destination', None)
                         if upload_path is not None:
-                            threads.append(threading.Thread(target=self.upload_file, args=(file_path, upload_path, True, uploadEntryList, True), daemon=True).start())
-
+                            threads.append(threading.Thread(target=self.upload_file, args=(file_path, upload_path, True, True, True), daemon=True).start())
+                    
                     count = 0
-                    while len(uploadEntryList) != len(threads):
+                    while len(threads) > 0:
                         time.sleep(10)
-                        count += 1
-                        if count % 6 == 0:
-                            self.log.info('uploadEntryList: {}, threads: {}'.format(len(uploadEntryList), len(threads)))
-                    batch_upload = dbx.files_upload_session_finish_batch_v2(uploadEntryList)
-                    self.check_status(batch_upload)
+                        # remove completed threads
+                        threads[:] = [t for t in threads if t.is_alive()]
+                        if (count := count + 1) % 6 == 0:
+                            self.log.info('uploadEntryList: {}, threads: {}'.format(len(self.uploadEntryList), len(threads)))
+                    if len(self.uploadEntryList) > 0:
+                        batch_upload = dbx.files_upload_session_finish_batch_v2(self.uploadEntryList)
+                        self.check_status(batch_upload)
                         
             except ApiError as e:
                 self.log.exception(e)
+            self.uploadEntryList = []
+            self.log.info('Batch Upload Completed')
         
     def check_status(self, job_id):
         try:
