@@ -457,6 +457,11 @@ class DropBoxUpload:
                 if not overwrite and self.duplicate_file(file_path, dest_path):
                     self.log.debug("File {} already exists in the destination folder - not overwriting".format(file_basename))
                     return True
+                    
+                space = self.get_free_space()
+                if file_size >= space:
+                    self.log.warning('File {} is too large to upload. Size: {}, Space: {}'.format(file_basename, human_size(file_size), human_size(space)))
+                    return True
                         
                 since = time.time()
                 if not file_path in self.files.keys():
