@@ -109,6 +109,9 @@ class StreamHasher(object):
     def fileno(self):
         return self._f.fileno()
 
+    def seek(self, *args):
+        return self._f.seek(*args)
+
     def tell(self):
         return self._f.tell()
 

@@ -4,26 +4,31 @@
 '''
 Dropbox app for API v2.
 NOTE: all dates/times are UTC
+1/4/2022 V 1.0.0 N Waterton - Initial Release
+8/7/2022 V 1.0.1 N Waterton - Addred rerty if internet down
+1/2/2023 V 1.0.2 N Waterton - added multiple directory handling
 '''
 
 import os, argparse, time, json, sys, time
 from datetime import datetime, timedelta, timezone
 import pytz
+from types import SimpleNamespace
 import logging
 from logging.handlers import RotatingFileHandler
 import threading
 import signal
+from requests.exceptions import ConnectionError
 import dropbox
 from dropbox import DropboxOAuth2FlowNoRedirect
-from dropbox.exceptions import ApiError, AuthError
+from dropbox.exceptions import ApiError, AuthError, InternalServerError
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import LoggingEventHandler
 from watchdog.events import FileSystemEventHandler
 
-from dropbox_content_hasher import DropboxContentHasher
+from dropbox_content_hasher import DropboxContentHasher, StreamHasher
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 APP = 'NicksPythonUploader'
 #Put your app key here (or include it as an argument to command line)
@@ -33,16 +38,21 @@ utc=pytz.UTC
 
 class MyHandler(FileSystemEventHandler):
 
-    def __init__(self, dbu, log=None, arg=None):
+    def __init__(self, dbu, log=None, arg=None, upload_path=None):
         if log is not None:
             self.log = log
         else:
             self.log = logger.getlogger('Main.'+self.__class__.__name__)
             
         self.arg = arg
+        self.upload_path = upload_path
         self.threads = {}
         self.lock = threading.Lock()
         self.dbu = dbu
+        
+    @property
+    def monitoring(self):
+        return len(self.threads)
 
     def process(self, event):
         """
@@ -69,7 +79,7 @@ class MyHandler(FileSystemEventHandler):
                 # the file will be processed here (ignore tmp files)
                 if path not in self.threads.keys() and not path.endswith('.tmp'):
                     self.log.info("file: {}, event: {}".format(path, event.event_type))
-                    self.threads[path] = threading.Thread(target=self.wait_for_file_to_arrive, args=(path, event.event_type == 'moved'), daemon=True).start()
+                    threading.Thread(target=self.wait_for_file_to_arrive, args=(path, event.event_type == 'moved'), daemon=True).start()
 
     def on_modified(self, event):
         #self.process(event)
@@ -84,20 +94,24 @@ class MyHandler(FileSystemEventHandler):
     def wait_for_file_to_arrive(self, file, immediate=False):
         try:
             count = 0
+            self.threads[file] = 'in progress'
             self.log.debug("Waiting for: file: {}, immediate: {}".format(file, immediate))
             if immediate or self.file_has_arrived(file):
                 self.log.info("file: {}, has finished updating".format(file))
                 #upload file to dropbox
-                if os.path.exists(file):
+                if os.path.exists(file) and self.upload_path:
                     self.log.info('Uploading: file: {}'.format(file))
-                    while not self.dbu.upload_files(file, self.arg.upload_path, self.arg.overwrite):
+                    while not self.dbu.upload_files(file, self.upload_path, self.arg.overwrite):
                         if (count := count + 1) >= 5:
                             self.log.error('Too many retries uploading {file}: aborting')
                             break
                         self.log.warning(f'Upload of {file} Failed, retrying in 60 seconds: {count}')
                         time.sleep(60)
                 else:
-                    self.log.warning('Not Uploading File: {}, file does not exist'.format(file))
+                    if not self.upload_path:
+                        self.log.warning('Not Uploading File: {}, NO upload path'.format(file))
+                    else:
+                        self.log.warning('Not Uploading File: {}, file does not exist'.format(file))
             else:
                 self.log.warning("file: {}, problem, skipping".format(file))
         except Exception as e:
@@ -114,8 +128,8 @@ class MyHandler(FileSystemEventHandler):
                 if not os.path.exists(file):
                     self.log.info("File does not exist: File: {}, size {}".format(file, human_size(size)))
                     return False
-                if file not in self.threads:
-                    self.log.debug("Thread does not exist: File: {}, size {}".format(file, human_size(size)))
+                if file not in self.threads.keys():
+                    self.log.warning("Thread does not exist: File: {}, size {}".format(file, human_size(size)))
                     return False
                 self.log.debug("Getting File Size: File: {}".format(file))
                 size = os.path.getsize(file)
@@ -148,8 +162,9 @@ class DropBoxUpload:
         self.log = log if log is not None else logging.getLogger('Main.'+self.__class__.__name__)
         self.APP_KEY = app_key if app_key else self.APP_KEY
         #dont calculate hash size for files bigger than this as it takes too long...
-        self.max_file_size_for_hash = 1024*100
+        self.max_file_size_for_hash = 10 * 1024 * 1024
         self.uploadEntryList = []
+        self.oldest_files = {}
         self.lock = threading.Lock()
         self.load_tokens()
         self.load_inProgress()
@@ -161,10 +176,18 @@ class DropBoxUpload:
                 if not self.APP_KEY:
                     self.APP_KEY = self.tokens['app_key']
                     self.log.info(f'Loaded app_key: {self.APP_KEY}')
-                with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
-                    dbx.users_get_current_account()
-                    self.log.info("Successfully connected to Dropbox")
+                while True:
+                    try:
+                        with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
+                            dbx.users_get_current_account()
+                            self.log.info("Successfully connected to Dropbox")
+                            break
+                    except ConnectionError as e:
+                        self.log.error(e)
+                        time.sleep(60)
+                        self.log.warning('Retrying dropbox connection')
         except Exception as e:
+            self.log.exception(e)
             if self.APP_KEY:
                 self.authorize()
             else:
@@ -248,13 +271,15 @@ class DropBoxUpload:
             # Store this to use over and over whenever an access token expires
             self.save_tokens()
             
-    def show_progress(self, time_elapsed, uploaded_percent=None, filename=''):
+    def show_progress(self, time_elapsed, uploaded_percent=None, filename='', comment=''):
         if filename:
             filename+= ': '
+        if comment:
+            comment = ', {}'.format(comment)
         if uploaded_percent is not None:
-            self.log.info('{}Uploaded {:.2f}%'.format(filename, uploaded_percent).ljust(15) + ' --- {:.0f}m {:.0f}s'.format(time_elapsed//60,time_elapsed%60).rjust(15))
+            self.log.info('{}Uploaded {:.2f}%'.format(filename, uploaded_percent).ljust(15) + ' --- {:.0f}m {:.0f}s'.format(time_elapsed//60,time_elapsed%60).rjust(15) + '{}'.format(comment))
         else:
-            self.log.info('{}Uploaded {:.2f}%'.format(filename, 100).ljust(15) + ' --- {:.0f}m {:.0f}s'.format(time_elapsed//60,time_elapsed%60).rjust(15))
+            self.log.info('{}Uploaded {:.2f}%'.format(filename, 100).ljust(15) + ' --- {:.0f}m {:.0f}s'.format(time_elapsed//60,time_elapsed%60).rjust(15) + '{}'.format(comment))
         
     def get_client_info(self):
         with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
@@ -302,10 +327,14 @@ class DropBoxUpload:
         
     def get_file_hash(self, path):
         hasher = DropboxContentHasher()
+        progress = 0
         with open(path, 'rb') as f:
             while True:
-                chunk = f.read(1024*50)  # or whatever chunk size you want
-                if len(chunk) == 0:
+                chunk = f.read(512 * 1024 * 1024)  # or whatever chunk size you want
+                progress = f.tell()
+                if len(chunk) != 0:
+                    self.log.debug('Hasher Read {} of {}'.format(human_size(progress), path))
+                else:
                     break
                 hasher.update(chunk)
         return hasher.hexdigest()
@@ -314,22 +343,75 @@ class DropBoxUpload:
         mtime = os.path.getmtime(path)
         return datetime(*time.gmtime(mtime)[:6])
         
-    def duplicate_file(self, file_path, dest_path):
-        file = self.get_file_metadata(dest_path)
+    def get_hash_from_filename(self, file, files_metadata=[]):
+        file = os.path.basename(file)
+        for file_meta in files_metadata:
+            if file_meta.name == file:
+                return {'content_hash': file_meta.content_hash, 'size': file_meta.size} 
+        return None
+        
+    def duplicate_file(self, file_path, dest_path, metadata=None, hash=None, force=False):
+        if not metadata:
+            file = self.get_file_metadata(dest_path)
+        else:
+            file = SimpleNamespace(**metadata)
         if file is not None:
             if isinstance(file, dropbox.files.FolderMetadata):
                 return False
-            if file.size <= self.max_file_size_for_hash:
-                hash = self.get_file_hash(file_path)
+            if (force or hash) or file.size <= self.max_file_size_for_hash:
+                if not hash:
+                    hash = self.get_file_hash(file_path)
+                #self.log.info('comparing file hash: {} with dropbox hash: {}'.format(hash, file.content_hash))
                 if hash == file.content_hash:
                     return True
             else:
                 #mtime = self.get_modified_time(file_path)
                 #self.log.info('comparing: mtime: {} with client_modified: {}'.format(mtime, file.client_modified))
                 #if file.size == os.path.getsize(file_path) and file.client_modified == mtime:
+                self.log.info('{} comparing file size'.format(file_path))
                 if file.size == os.path.getsize(file_path):
                    return True 
         return False
+        
+    def check_all_hashes(self, file_path, dest_path, force=False):
+        self.log.info('Checking uploaded files {} => {}'.format(file_path, dest_path))
+        total_files = ok_count = bad_count = 0
+        bad_list = []
+        try:
+            uploaded_files = self.file_list(dest_path)
+            total_files = len(uploaded_files)
+            #self.log.info('got {} files: {}'.format(len(uploaded_files), uploaded_files))
+            for dest_file_meta in uploaded_files:
+                dest_file = dest_file_meta.path_display
+                local_file = os.path.join(file_path, os.path.basename(dest_file))
+                if os.path.exists(local_file):
+                    self.log.debug('Checking if local file: {} == {}'.format(local_file, dest_file))
+                    if (ok_count + bad_count) % 10 == 0 and force:
+                        self.log.info('Hashes checked in {}: {}, OK: {}, bad: {}'.format(dest_path, ok_count + bad_count, ok_count, bad_count))
+                    check = self.check_hashes(local_file, dest_file, warn_only=True, metadata=self.get_hash_from_filename(dest_file_meta.name, uploaded_files), force=force)
+                    if check:
+                        ok_count += 1
+                    else:
+                        bad_count += 1
+                        bad_list.append(dest_file)
+        
+        except InternalServerError:
+            self.log.warning('InternalServerError, hash checking cut short...')
+        except Exception as e:
+            self.log.exception(e)
+        self.log.info('Done Checking {}, Total files: {}, checked {} uploaded files in {}, OK: {}, bad {}'.format(dest_path, total_files, ok_count + bad_count, dest_path, ok_count, bad_count))
+        if bad_list:
+            self.log.warning('Bad uploaded files: \r\n{}'.format('\r\n'.join(bad_list)))
+        return bad_list
+        
+    def check_hashes(self, file_path, dest_path, warn_only=False, metadata=None, force=False):
+        match = self.duplicate_file(file_path, dest_path, metadata, force=force)
+        if match:
+            if not warn_only:
+                self.log.info('File hash {} matches {}'.format(file_path, dest_path))
+        else:
+            self.log.warning('File hash {} DOES NOT MATCH {}'.format(file_path, dest_path))
+        return match
         
     def get_free_space(self):
         allocated, used = self.get_dropbox_space_info()
@@ -394,6 +476,31 @@ class DropBoxUpload:
             else:
                 self.log.info("Unknown: {}".format(file.path_display))
                 
+    def delete_oldest_file(self, path):
+        '''
+        delete oldest file in path
+        '''
+        if path == '/':
+            self.log.error('cannot delete all files/folders in {}'.format(path))
+            return
+        self.oldest_files = {}
+        #self.log.info('deleting oldest file in path: {}'.format(path))
+        file = self.get_file_metadata(path)
+        if isinstance(file, dropbox.files.FileMetadata):
+            self.log.warning("Path must be a folder, not a file: {}".format(path))
+            return
+        elif isinstance(file, dropbox.files.FolderMetadata):
+            for file in self.file_list(path):
+                self.oldest_files[file.path_lower] = utc.localize(file.client_modified)
+        if self.oldest_files:
+            oldest_file = min(self.oldest_files, key=self.oldest_files.get)
+            self.log.info('Deleteing: {}, modified: {}'.format(oldest_file, self.oldest_files[oldest_file]))
+            self.delete_file(oldest_file)
+            #self.log.info('Would Delete: {}, modified: {}'.format(oldest_file, self.oldest_files[oldest_file]))
+        else:
+            self.log.warning('No oldest file to delete in Path: {}'.format(path))
+        self.oldest_files = {}
+                
     def delete_folder(self, path):
         if path == '/':
             self.log.error('cannot delete all files/folders in {}'.format(path))
@@ -411,6 +518,7 @@ class DropBoxUpload:
         if path == '/':
             self.log.error('cannot delete all files/folders in {}'.format(path))
             return
+        #self.log.info('deleting files in path: {}'.format(path))
         file = self.get_file_metadata(path)
         if isinstance(file, dropbox.files.FileMetadata):
             if utc.localize(file.client_modified) < older_than:
@@ -444,7 +552,6 @@ class DropBoxUpload:
                 self.upload_files(os.path.join(path, file), upload_path, overwrite, recursive, batch, depth) 
 
     def upload_file(self, file_path, upload_path, overwrite=True, batch=False, destinationIsFile=False):
-        
         if self.files.get(file_path, {}).get('uploading', False):
             self.log.info('Already uploading: {}'.format(file_path))
             return True
@@ -472,12 +579,15 @@ class DropBoxUpload:
                     self.files[file_path] = {}
                 self.files[file_path]['uploading'] = True
                 self.files[file_path]['batch'] = batch
+                calc_hash = True
                 
                 self.log.info('Uploading file: {} => {}'.format(file_path, dest_path))
-                with open(file_path, 'rb') as f:
+                hasher = DropboxContentHasher()
+                with open(file_path, 'rb') as raw_f:
+                    f = StreamHasher(raw_f, hasher)
                     if file_size <= self.chunk and not batch:
                         dbx.files_upload(f.read(), dest_path, client_modified=self.get_modified_time(file_path))
-                        self.show_progress(time.time() - since, filename=file_basename)
+                        self.show_progress(time.time() - since, filename=file_basename, comment='Upload Completed')
                         self.files.pop(file_path, None)
                     else:
                         if self.files[file_path].get('session', None) is None:
@@ -490,6 +600,7 @@ class DropBoxUpload:
                         else:
                             f.seek(self.files[file_path].get('position', f.tell()))
                             startdate = self.files[file_path].get('date', datetime.now().isoformat())
+                            calc_hash = False
                             self.log.info('Resuming upload of: {} at {}% started on: {}'.format(file_basename, round(100*f.tell()/file_size, 2), startdate))
                         cursor = dropbox.files.UploadSessionCursor(session_id=self.files[file_path]['session'],offset=f.tell())
                         dest_path = self.files[file_path].get('destination', dest_path)
@@ -534,6 +645,13 @@ class DropBoxUpload:
                                 self.files[file_path]['position'] = f.tell()
                                 self.show_progress(time.time() - since, 100*f.tell()/file_size, filename=file_basename)
                             self.save_inProgress()
+                if calc_hash:
+                    if batch:
+                        self.files[file_path]['hash'] = hasher.hexdigest()
+                    else:
+                        self.check_file_hash(file_path, dest_path, hasher.hexdigest())
+                else:
+                    self.log.warning('{}, Unable to check the hash of resumed files'.format(file_path))
                 self.save_inProgress()
             return True
         except ApiError as e:
@@ -548,11 +666,12 @@ class DropBoxUpload:
     def get_file_list(self, dir_path, upload_path, overwrite=True, recursive=False, older_than=None, file_dict={}):
         if os.path.isdir(dir_path):
             file_list = os.listdir(dir_path)
+            uploaded_files = self.file_list(upload_path, recursive)
             for file in file_list:
                 file_path = join_path(dir_path, file)
-                dest_path = join_path(upload_path, file)
+                dest_path = join_path(upload_path, file)      
                 if os.path.isfile(file_path) and (older_than is None or utc.localize(self.get_modified_time(file_path)) >= older_than):
-                    if not overwrite and self.duplicate_file(file_path, dest_path):
+                    if not overwrite and self.duplicate_file(file_path, dest_path, metadata=self.get_hash_from_filename(file, uploaded_files)):
                         continue
                     file_dict[file_path] = {'destination': dest_path}
                     self.log.debug('Added {} => {} to file_dict'.format(file_path, file_dict[file_path]['destination']))
@@ -567,12 +686,14 @@ class DropBoxUpload:
         '''
         Batch upload, starts multiple files upload at once
         '''
+        org_dir_path = 'NONE'
         if not isinstance(dir_path, dict) and not os.path.isdir(dir_path):
             self.log.error('Batch upload path must be a directory or dictionary: {}'.format(dir_path))
             return
         with self.lock: #only one batch upload at a time allowed
             try:
-                self.log.info('Batch Upload Starting {}'.format(dir_path if isinstance(dir_path, str) else list(dir_path.keys())))
+                org_dir_path = dir_path if isinstance(dir_path, str) else list(dir_path.keys())
+                self.log.info('Batch Upload Starting {}'.format(org_dir_path))
                 with dropbox.Dropbox(oauth2_refresh_token=self.tokens['refresh_token'], app_key=self.APP_KEY) as dbx:
                     #self.uploadEntryList = []
                     threads = []
@@ -591,12 +712,13 @@ class DropBoxUpload:
                         upload_path = dir_path[file_path].get('destination', None)
                         if upload_path is not None:
                             threads.append(threading.Thread(target=self.upload_file, args=(file_path, upload_path, True, True, True), daemon=True).start())
+                            #self.log.info('Total Uploads: threads: {}'.format(len(threads)))
                     
                     count = 0
                     while len(threads) > 0:
                         time.sleep(10)
                         # remove completed threads
-                        threads[:] = [t for t in threads if t.is_alive()]
+                        threads[:] = [t for t in threads if t is not None and t.is_alive()]
                         if (count := count + 1) % 6 == 0:
                             self.log.info('uploadEntryList: {}, threads: {}'.format(len(self.uploadEntryList), len(threads)))
                     if len(self.uploadEntryList) > 0:
@@ -606,7 +728,7 @@ class DropBoxUpload:
             except ApiError as e:
                 self.log.exception(e)
             self.uploadEntryList = []
-            self.log.info('Batch Upload Completed')
+            self.log.info('Batch Upload Completed {}'.format(org_dir_path))
         
     def check_status(self, job_id):
         try:
@@ -617,6 +739,7 @@ class DropBoxUpload:
                         for entry in job_id.get_complete().entries:
                             if entry.is_success():
                                 self.log.info('Upload Success: {}'.format(entry.get_success().name))
+                                self.check_file_hash(None, entry.get_success().path_display, None)
                                 self.remove_files_dict_entry(entry.get_success().path_display)
                             elif entry.is_failure():
                                 self.log.info('Upload Failure: {}'.format(entry.get_failure()))
@@ -629,6 +752,7 @@ class DropBoxUpload:
                     for entry in job_id.entries:
                         if entry.is_success():
                             self.log.info('Upload Success: {}'.format(entry.get_success().name))
+                            self.check_file_hash(None, entry.get_success().path_display, None)
                             self.remove_files_dict_entry(entry.get_success().path_display)
                         elif entry.is_failure():
                             self.log.info('Upload Failure: {}'.format(entry.get_failure()))
@@ -640,6 +764,7 @@ class DropBoxUpload:
                         for entry in result.get_complete().entries:
                             if entry.is_success():
                                 self.log.info('Upload Success: {}'.format(entry.get_success().name))
+                                self.check_file_hash(None, entry.get_success().path_display, None)
                                 self.remove_files_dict_entry(entry.get_success().path_display)
                             elif entry.is_failure():
                                 self.log.info('Upload Failure: {}'.format(entry.get_failure()))
@@ -651,6 +776,27 @@ class DropBoxUpload:
         except ApiError as e:
             self.log.exception(e)
         return None
+        
+    def check_file_hash(self, file_path, dest_path, hash):
+        try:
+            if not file_path:
+                for k,v in self.files.items():
+                    if os.path.basename(k) == os.path.basename(dest_path):
+                        file_path = k
+                        if not hash:
+                            hash = v.get('hash')
+                        break
+            if not file_path or not hash:
+                self.log.warning('{}, Could not find hash'.format(dest_path))
+                return False
+            if self.duplicate_file(file_path, dest_path, hash=hash):
+                self.log.info('{}, File hash OK'.format(file_path))
+                return True
+            else:
+                self.log.info('{}, File hashes do NOT match'.format(file_path))
+        except Exception as e:
+            self.log.exception(e)
+        return False
         
     def remove_files_dict_entry(self, path):
         for k,v in self.files.copy().items():
@@ -686,7 +832,11 @@ class DropBoxUpload:
             self.log.exception(e)
     
 def join_path(basepath, path):
-    return os.path.join(basepath, *path.split(os.path.sep))
+    try:
+        return os.path.join(basepath, *path.split(os.path.sep))
+    except Exception as e:
+        log.info('join_path: basepath: {}, path: {}'.format(basepath, path))
+        raise()
 
 def is_on_mount(path):
     return False if path == os.path.dirname(path) else True if os.path.ismount(path) else is_on_mount(os.path.dirname(path))
@@ -751,12 +901,20 @@ def setup_logger(logger_name, log_file, level=logging.DEBUG, console=False):
 def exit_handler(signum, frame):
     log.info(f'{signal.strsignal(signum)} received. Exiting....')
     exit(0)
+    
+def make_absolute_path(path):
+    if not path:
+        log.error('path not found: {}'.format(path))
+        sys.exit(1)
+    elif not path.startswith('/'):
+        return '/' + path
+    return path
 
 def main():
     parser = argparse.ArgumentParser(description='Upload/Download files to/from dropbox')
     parser.add_argument('action', type=str, choices=['client', 'list', 'info', 'upload', 'delete', 'delete_folder', 'monitor', 'download'], default=None, help='action to take (default: %(default)s)')
-    parser.add_argument('-f','--file_path', type=str, default=None, help='path to file to upload (default: %(default)s)')
-    parser.add_argument('-u','--upload_path', type=str, default=None, help='path in dropbox (default: %(default)s)')
+    parser.add_argument('-f','--file_path', type=str, action='append', default=[], help='path to file to upload (default: %(default)s)')
+    parser.add_argument('-u','--upload_path', type=str, action='append', default=[], help='path in dropbox (default: %(default)s)')
     parser.add_argument('-t','--timeout', type=int, default=100, help='upload timeout (seconds) (default: %(default)s)')
     parser.add_argument('-c','--chunk', type=int, default=50, help='chunk size in MB (default: %(default)s)')
     parser.add_argument('-m','--min_free_space', type=int, default=25, help='minnimum free space for upload when monitoring as %% of total (default: %(default)s)')
@@ -797,85 +955,115 @@ def main():
     #register interrupt handler
     signal.signal(signal.SIGINT, exit_handler)
     
-    if arg.upload_path is not None and not arg.upload_path.startswith('/'):
-        arg.upload_path = '/' + arg.upload_path
-    
     dbu = DropBoxUpload(timeout=arg.timeout, chunk=arg.chunk, app_key=arg.app_key, log=log)
     log.info('Action: {}'.format(arg.action))
     if arg.action == 'client':
         dbu.get_client_info()
     elif arg.action == 'list':
-        if arg.upload_path is None:
+        if not arg.upload_path:
             log.error('--upload_path is required')
             sys.exit(1)
-        dbu.list_files(arg.upload_path, arg.recursive)
+        for upload_path in arg.upload_path:
+            log.info('listing files in: {}'.format(upload_path))
+            dbu.list_files(make_absolute_path(upload_path), arg.recursive)
     elif arg.action == 'info':
-        if arg.upload_path is None:
+        if not arg.upload_path:
             log.error('--upload_path is required')
             sys.exit(1)
-        dbu.get_file_metadata(arg.upload_path)
+        for upload_path in arg.upload_path:
+            dbu.get_file_metadata(make_absolute_path(upload_path))
     elif arg.action == 'upload':
-        if arg.file_path is None or arg.upload_path is None:
+        if not arg.file_path or not arg.upload_path:
             log.error('--file_path and  --upload_path are required')
             sys.exit(1)
-        dbu.upload_files(arg.file_path, arg.upload_path, arg.overwrite, arg.recursive)
+        for i in range(len(arg.file_path)):
+            dbu.upload_files(arg.file_path[i], make_absolute_path(arg.upload_path[i]), arg.overwrite, arg.recursive)
     elif arg.action == 'download':
-        if arg.file_path is None or arg.upload_path is None:
+        if not arg.file_path or not arg.upload_path:
             log.error('--file_path and  --upload_path are required')
             sys.exit(1)
-        dbu.download_files(arg.file_path, arg.upload_path, arg.overwrite, arg.recursive)
+        for i in range(len(arg.file_path)):
+            dbu.download_files(arg.file_path[i], make_absolute_path(arg.upload_path[i]), arg.overwrite, arg.recursive)
     elif arg.action == 'delete':
-        if arg.upload_path is None:
+        if not arg.upload_path:
             log.error('--upload_path is required')
             sys.exit(1)
         older_than = datetime.now(timezone.utc) - timedelta(days=arg.older_than)
         log.info('Deleting dropbox folders/files in {} older than {}'.format(arg.upload_path, older_than.isoformat()))
-        dbu.delete_files(arg.upload_path, older_than)
+        dbu.delete_files(make_absolute_path(arg.upload_path), older_than)
     elif arg.action == 'delete_folder':
-        if arg.upload_path is None:
+        if not arg.upload_path:
             log.error('--upload_path is required')
             sys.exit(1)
-        dbu.delete_folder(arg.upload_path)
+        for upload_path in arg.upload_path:
+            dbu.delete_folder(make_absolute_path(upload_path))
     elif arg.action == 'monitor':
-        if arg.file_path is None or arg.upload_path is None:
-            log.error('--file_path and  --upload_path are required')
-            sys.exit(1)
-        if not os.path.isdir(arg.file_path):
-            self.log.error('--file_path: {} Must be a directory'.format(arg.file_path))
+        if not arg.file_path or not arg.upload_path and len(arg.file_path) != len(arg.upload_path):
+            log.error('--file_path and  --upload_path are required and much match in pairs')
             sys.exit(1)
                
         time.sleep(len(dbu.files)*2)    #wait for interrupted files to resume uploading
         older_than = datetime.now(timezone.utc) - timedelta(days=arg.older_than)
-        log.info('Uploading files in {} to {} newer than {}'.format(arg.file_path, arg.upload_path, older_than.isoformat()))
-        upload = dbu.start_batch_upload(arg.file_path, arg.upload_path, arg.overwrite, arg.recursive, older_than=older_than)
-            
-        log.info("monitoring directory: {} for changes".format(arg.file_path))
-
-        if is_on_mount(arg.file_path):
+        upload = {}
+        for i, file_path in enumerate(arg.file_path):
+            try:
+                if not os.path.isdir(file_path):
+                    log.error('--file_path: {} Must be a directory'.format(file_path))
+                    sys.exit(1)
+                upload[i] = {}
+                upload[i]['file_path'] = file_path
+                upload[i]['upload_path'] = make_absolute_path(arg.upload_path[i])
+            except Exception as e:
+                log.exception(e)
+                sys.exit(1)
+                
+        if any([is_on_mount(u['file_path']) for u in upload.values()]):
             # have to poll a mounted file system - poll every 10 seconds
             observer = PollingObserver(10)
         else:
             observer = Observer()
-        Handler = MyHandler(dbu, log, arg)
-        observer.schedule(Handler, arg.file_path, recursive=arg.recursive)
+            
+        for u in upload.values():
+            log.info('Uploading files in {} to {} newer than {}'.format(u['file_path'], u['upload_path'], older_than.isoformat()))
+            u['uploader'] = dbu.start_batch_upload(u['file_path'], u['upload_path'], arg.overwrite, arg.recursive, older_than=older_than)
+            log.info("monitoring directory: {} for changes".format(u['file_path']))
+            u['handler'] = MyHandler(dbu, log, arg, u['upload_path'])
+            observer.schedule(u['handler'], u['file_path'], recursive=arg.recursive) 
         observer.start()
+        
+        try:
+            for u in upload.values():
+                dbu.check_all_hashes(u['file_path'], u['upload_path'], force=False)
+        except Exception as e:
+            log.exception('File verification cut short: {}'.format(e))
+        
         try:
             while True:
                 pct_free = dbu.get_free_space_percent()
-                log.info("Monitoring {} files, Dropbox free space: {}%".format(len(Handler.threads), pct_free))
-                if (pct_free < arg.min_free_space):
-                    self.log.warning('Free space is {}%, less than minnimum allowed: {}%'.format(pct_free, arg.min_free_space))
-                    if arg.older_than > 0:
-                        dbu.delete_files(dbu, arg)
+                monitoring = ['{}: {}'.format(u['handler'].monitoring,u['file_path']) for u in upload.values()]
+                log.info("Monitoring {}, Dropbox free space: {}%".format(', '.join(monitoring), pct_free))
+                if (pct_free < arg.min_free_space and all([u['handler'].monitoring == 0 for u in upload.values()])):
+                    log.warning('Free space is {}%, less than minnimum allowed: {}%'.format(pct_free, arg.min_free_space))
+                    max_files = 0
+                    delete_path = None
+                    for u in upload.values():
+                        num_files = len(dbu.file_list(u['upload_path'], arg.recursive))
+                        if num_files > max_files:
+                            max_files = num_files
+                            delete_path = u['upload_path']
+                            
+                    if delete_path and max_files != 0:
+                        dbu.delete_oldest_file(delete_path)
                 time.sleep(60)
         except (KeyboardInterrupt, SystemExit):
             log.info('Stopping observer')
             observer.stop()
         observer.join()
-        log.info('Program Exited')
+        log.info('Program Exited, threads still running: {}'.format(threading.active_count()))
         
-    while threading.active_count() > 0:    #wait for resumed uploads to complete
+    while threading.active_count() > 1:    #wait for resumed uploads to complete
         time.sleep(10)
+    log.info('Program Done')
 
 if __name__ == "__main__":
     main()
